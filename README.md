@@ -1,6 +1,6 @@
 # Enhancing Real-Time Object Detection with Global Additive Attention and Frequency-Aware Feature Fusion
 
-[FIG1.pdf](https://github.com/user-attachments/files/18817480/FIG1.pdf)
+![image](https://github.com/user-attachments/assets/9825f66d-f160-4937-a7d2-ab57706c0d2d)
 
 In view of the fact that the existing YOLO model is difficult to meet people’s
 needs in terms of detection accuracy and computational efficiency, especially in
