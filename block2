@@ -1,0 +1,393 @@
+import torch
+import torch.nn as nn
+from ultralytics.nn.modules.conv import autopad
+
+from ultralytics.nn.modules import C2f, DFL
+import math
+import torch.nn.functional as F
+from ultralytics.utils.tal import dist2bbox, make_anchors, dist2rbox
+
+############################################################# CDF #############################################################
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+    'survival rate' as the argument.
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
+class ConditionalPositionEncoding(nn.Module):
+    """
+    Implementation of conditional positional encoding. For more details refer to paper:
+    `Conditional Positional Encodings for Vision Transformers <https://arxiv.org/pdf/2102.10882.pdf>`_
+    """
+    def __init__(self, in_channels, kernel_size):
+        super().__init__()
+        self.pe = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            bias=True,
+            groups=in_channels
+        )
+
+    def forward(self, x):
+        x = self.pe(x) + x
+        return x
+
+
+class DynamicMRConv4d(nn.Module):
+    def __init__(self, in_channels, out_channels, K):
+        super().__init__()
+        self.nn = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        self.K = K
+        # self.mean = 0
+        # self.std = 0
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_j = x - x
+
+        # get an estimate of the mean distance by computing the distance of points b/w quadrants. This is for efficiency to minimize computations.
+        x_rolled = torch.cat([x[:, :, -H // 2:, :], x[:, :, :-H // 2, :]], dim=2)
+        x_rolled = torch.cat([x_rolled[:, :, :, -W // 2:], x_rolled[:, :, :, :-W // 2]], dim=3)
+
+        # Norm, Euclidean Distance
+        norm = torch.norm((x - x_rolled), p=1, dim=1, keepdim=True)
+
+        mean = torch.mean(norm, dim=[2, 3], keepdim=True)
+        std = torch.std(norm, dim=[2, 3], keepdim=True)
+
+        for i in range(0, H, self.K):
+            x_rolled = torch.cat([x[:, :, -i:, :], x[:, :, :-i, :]], dim=2)
+
+            dist = torch.norm((x - x_rolled), p=1, dim=1, keepdim=True)
+
+            # Got 83.86%
+            mask = torch.where(dist < mean - std, 1, 0)
+
+            x_rolled_and_masked = (x_rolled - x) * mask
+            x_j = torch.max(x_j, x_rolled_and_masked)
+
+        for j in range(0, W, self.K):
+            x_rolled = torch.cat([x[:, :, :, -j:], x[:, :, :, :-j]], dim=3)
+
+            dist = torch.norm((x - x_rolled), p=1, dim=1, keepdim=True)
+
+            mask = torch.where(dist < mean - std, 1, 0)
+
+            x_rolled_and_masked = (x_rolled - x) * mask
+            x_j = torch.max(x_j, x_rolled_and_masked)
+
+        x = torch.cat([x, x_j], dim=1)
+        return self.nn(x)
+
+class Grapher(nn.Module):
+    """
+    Grapher module with graph convolution and fc layers
+    """
+
+    def __init__(self, in_channels, K):
+        super(Grapher, self).__init__()
+        self.channels = in_channels
+        self.K = K
+
+        self.cpe = ConditionalPositionEncoding(in_channels, kernel_size=7)
+        self.fc1 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.graph_conv = DynamicMRConv4d(in_channels * 2, in_channels, K=self.K)
+        self.fc2 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )  # out_channels back to 1x}
+
+    def forward(self, x):
+        x = self.cpe(x)
+        x = self.fc1(x)
+        x = self.graph_conv(x)
+        x = self.fc2(x)
+
+        return x
+
+class DynamicGraphConvBlock(nn.Module):
+    def __init__(self, in_dim, drop_path=0., K=2, use_layer_scale=True, layer_scale_init_value=1e-5):
+        super().__init__()
+
+        self.mixer = Grapher(in_dim, K)
+        self.ffn = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim * 4, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_dim * 4),
+            nn.GELU(),
+            nn.Conv2d(in_dim * 4, in_dim, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_dim),
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.use_layer_scale = use_layer_scale
+        if use_layer_scale:
+            self.layer_scale_1 = nn.Parameter(
+                layer_scale_init_value * torch.ones(in_dim), requires_grad=True)
+            self.layer_scale_2 = nn.Parameter(
+                layer_scale_init_value * torch.ones(in_dim), requires_grad=True)
+
+    def forward(self, x):
+        if self.use_layer_scale:
+            x = x + self.drop_path(self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.mixer(x))
+            x = x + self.drop_path(self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * self.ffn(x))
+        else:
+            x = x + self.drop_path(self.mixer(x))
+            x = x + self.drop_path(self.ffn(x))
+        return x
+
+
+class CDF(C2f):
+    def __init__(self, c1, c2, n=1, k=2, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(DynamicGraphConvBlock(in_dim=self.c, K=k) for _ in range(n))
+
+
+########################################################## CDF #############################################################
+
+############################################################ TDSC ############################################################
+try:
+    from mmcv.cnn import build_activation_layer, build_norm_layer
+    from mmcv.ops.modulated_deform_conv import ModulatedDeformConv2d
+    from mmengine.model import constant_init, normal_init
+except ImportError as e:
+    pass
+
+class Scale(nn.Module):
+    """A learnable scale parameter.
+
+    This layer scales the input by a learnable factor. It multiplies a
+    learnable scale parameter of shape (1,) with input of any shape.
+
+    Args:
+        scale (float): Initial value of scale factor. Default: 1.0
+    """
+
+    def __init__(self, scale: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(scale, dtype=torch.float))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale
+
+class Conv_GN(nn.Module):
+    """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
+
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initialize Conv layer with given arguments including activation."""
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.gn = nn.GroupNorm(16, c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        """Apply convolution, batch normalization and activation to input tensor."""
+        return self.act(self.gn(self.conv(x)))
+
+class DyDCN(nn.Module):
+    """ModulatedDeformConv2d with normalization layer used in DyHead.
+    This module cannot be configured with `conv_cfg=dict(type='DCNv2')`
+    because DyHead calculates offset and mask from middle-level feature.
+    Args:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        stride (int | tuple[int], optional): Stride of the convolution.
+            Default: 1.
+        norm_cfg (dict, optional): Config dict for normalization layer.
+            Default: dict(type='GN', num_groups=16, requires_grad=True).
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 stride=1,
+                 norm_cfg=dict(type='GN', num_groups=16, requires_grad=True)):
+        super().__init__()
+        self.with_norm = norm_cfg is not None
+        bias = not self.with_norm
+        self.conv = ModulatedDeformConv2d(
+            in_channels, out_channels, 3, stride=stride, padding=1, bias=bias)
+        if self.with_norm:
+            self.norm = build_norm_layer(norm_cfg, out_channels)[1]
+
+    def forward(self, x, offset, mask):
+        """Forward function."""
+        x = self.conv(x.contiguous(), offset, mask)
+        if self.with_norm:
+            x = self.norm(x)
+        return x
+
+class TaskDecomposition(nn.Module):
+    def __init__(self, feat_channels, stacked_convs, la_down_rate=8):
+        super(TaskDecomposition, self).__init__()
+        self.feat_channels = feat_channels
+        self.stacked_convs = stacked_convs
+        self.in_channels = self.feat_channels * self.stacked_convs
+        self.la_conv1 = nn.Conv2d(self.in_channels, self.in_channels // la_down_rate, 1)
+        self.relu = nn.ReLU(inplace=True)
+        self.la_conv2 = nn.Conv2d(self.in_channels // la_down_rate, self.stacked_convs, 1, padding=0)
+        self.sigmoid = nn.Sigmoid()
+
+        self.reduction_conv = Conv_GN(self.in_channels, self.feat_channels, 1)
+        self.init_weights()
+
+    def init_weights(self):
+        # self.la_conv1.weight.normal_(std=0.001)
+        # self.la_conv2.weight.normal_(std=0.001)
+        # self.la_conv2.bias.data.zero_()
+        # self.reduction_conv.conv.weight.normal_(std=0.01)
+
+        torch.nn.init.normal_(self.la_conv1.weight.data, mean=0, std=0.001)
+        torch.nn.init.normal_(self.la_conv2.weight.data, mean=0, std=0.001)
+        torch.nn.init.zeros_(self.la_conv2.bias.data)
+        torch.nn.init.normal_(self.reduction_conv.conv.weight.data, mean=0, std=0.01)
+
+    def forward(self, feat, avg_feat=None):
+        b, c, h, w = feat.shape
+        if avg_feat is None:
+            avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+        weight = self.relu(self.la_conv1(avg_feat))
+        weight = self.sigmoid(self.la_conv2(weight))
+
+        # here we first compute the product between layer attention weight and conv weight,
+        # and then compute the convolution between new conv weight and feature map,
+        # in order to save memory and FLOPs.
+        conv_weight = weight.reshape(b, 1, self.stacked_convs, 1) * \
+                      self.reduction_conv.conv.weight.reshape(1, self.feat_channels, self.stacked_convs,
+                                                              self.feat_channels)
+        conv_weight = conv_weight.reshape(b, self.feat_channels, self.in_channels)
+        feat = feat.reshape(b, self.in_channels, h * w)
+        feat = torch.bmm(conv_weight, feat).reshape(b, self.feat_channels, h, w)
+        feat = self.reduction_conv.gn(feat)
+        feat = self.reduction_conv.act(feat)
+
+        return feat
+
+class Detect_TDSC(nn.Module):
+    # Task Dynamic Align Detection Head
+    """YOLOv8 Detect head for detection models."""
+
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, hidc=256, ch=()):
+        """Initializes the YOLOv8 detection layer with specified number of classes and channels."""
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        self.share_conv = nn.Sequential(Conv_GN(hidc, hidc // 2, 3), Conv_GN(hidc // 2, hidc // 2, 3))
+        self.cls_decomp = TaskDecomposition(hidc // 2, 2, 16)
+        self.reg_decomp = TaskDecomposition(hidc // 2, 2, 16)
+        self.DyDCN = DyDCN(hidc // 2, hidc // 2)
+        self.spatial_conv_offset = nn.Conv2d(hidc, 3 * 3 * 3, 3, padding=1)
+        self.offset_dim = 2 * 3 * 3
+        self.cls_prob_conv1 = nn.Conv2d(hidc, hidc // 4, 1)
+        self.cls_prob_conv2 = nn.Conv2d(hidc // 4, 1, 3, padding=1)
+        self.cv2 = nn.Conv2d(hidc // 2, 4 * self.reg_max, 1)
+        self.cv3 = nn.Conv2d(hidc // 2, self.nc, 1)
+        self.scale = nn.ModuleList(Scale(1.0) for x in ch)
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        for i in range(self.nl):
+            stack_res_list = [self.share_conv[0](x[i])]
+            stack_res_list.extend(m(stack_res_list[-1]) for m in self.share_conv[1:])
+            feat = torch.cat(stack_res_list, dim=1)
+
+            # task decomposition
+            avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+            cls_feat = self.cls_decomp(feat, avg_feat)
+            reg_feat = self.reg_decomp(feat, avg_feat)
+
+            # reg alignment
+            offset_and_mask = self.spatial_conv_offset(feat)
+            offset = offset_and_mask[:, :self.offset_dim, :, :]
+            mask = offset_and_mask[:, self.offset_dim:, :, :].sigmoid()
+            reg_feat = self.DyDCN(reg_feat, offset, mask)
+
+            # cls alignment
+            cls_prob = self.cls_prob_conv2(F.relu(self.cls_prob_conv1(feat))).sigmoid()
+
+            x[i] = torch.cat((self.scale[i](self.cv2(reg_feat)), self.cv3(cls_feat * cls_prob)), 1)
+        if self.training:  # Training path
+            return x
+
+        # Inference path
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        if self.export and self.format in ("saved_model", "pb", "tflite", "edgetpu", "tfjs"):  # avoid TF FlexSplitV ops
+            box = x_cat[:, : self.reg_max * 4]
+            cls = x_cat[:, self.reg_max * 4:]
+        else:
+            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        dbox = self.decode_bboxes(box)
+
+        if self.export and self.format in ("tflite", "edgetpu"):
+            # Precompute normalization factor to increase numerical stability
+            # See https://github.com/ultralytics/ultralytics/issues/7371
+            img_h = shape[2]
+            img_w = shape[3]
+            img_size = torch.tensor([img_w, img_h, img_w, img_h], device=box.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * img_size)
+            dbox = dist2bbox(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2], xywh=True, dim=1)
+
+        y = torch.cat((dbox, cls.sigmoid()), 1)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        # for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+        m.cv2.bias.data[:] = 1.0  # box
+        m.cv3.bias.data[: m.nc] = math.log(5 / m.nc / (640 / 16) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+    def decode_bboxes(self, bboxes):
+        """Decode bounding boxes."""
+        return dist2bbox(self.dfl(bboxes), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
