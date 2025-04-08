@@ -1,6 +1,6 @@
 # GFD-Net: Global-Frequency Dual-head Network for Real-Time Defect Detection
 
- 
+ ![image](https://github.com/ZJWstar/GFD-Net/blob/main/FIG1.pdf)
 *图1: GFD-Net整体架构示意图（示意图来自论文）*
 
 ## 📖 项目简介
