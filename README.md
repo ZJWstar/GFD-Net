@@ -46,7 +46,7 @@ model = nn.Sequential(backbone, detect_head)
 ```
 
 ## 📊 Performance Comparison
- ![image](https://github.com/ZJWstar/GFD-Net/blob/main/TABLE.png)
+![image](https://github.com/ZJWstar/GFD-Net/blob/main/TABLE.png)
 
 ## 🧩 Core Module
 ### 1. GCAS (Global Convolutional Additive Self-attention)
